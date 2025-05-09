@@ -1,0 +1,4 @@
+cryptography==39.0.1
+pybluez==0.23
+rich==12.5.1
+questionary==1.9.0
