@@ -51,26 +51,52 @@ class AESCipher:
 
 def send_message(sock, aes):
     while True:
-        message = questionary.text("Votre message :").ask()
+        message = questionary.text("Votre message ou nom de fichier :").ask()
         if message.lower() == "exit":
             console.print("[red]Déconnexion du serveur...[/red]")
             sock.close()
             break
-        encrypted_message = aes.encrypt(message.encode())
-        sock.sendall(encrypted_message)  # Envoi du message chiffré
+
+        # Vérifier si l'utilisateur souhaite envoyer un fichier
+        if os.path.isfile(message):
+            # Si c'est un fichier, l'envoyer avec un préfixe **FILE**
+            with open(message, 'rb') as file:
+                file_data = file.read()
+                # Préfixer avec **FILE** et envoyer le nom du fichier
+                file_message = f"**FILE**{os.path.basename(message)}".encode()
+                sock.sendall(file_message)
+                sock.sendall(file_data)  # Envoyer le contenu du fichier
+            console.print(f"[green]Fichier '{message}' envoyé avec succès ![/green]")
+        else:
+            # Sinon, envoyer un message classique
+            encrypted_message = aes.encrypt(message.encode())
+            sock.sendall(encrypted_message)  # Envoi du message chiffré
 
 def handle_recv(sock, aes):
     while True:
         try:
-            # Réception des données par morceaux (buffer plus petit pour éviter un blocage)
             data = sock.recv(65536)
             if not data:
                 break  # Connexion fermée
-            
+
             # Vérification du préfixe pour le type de données reçues
             if data.startswith(b"**KEY**"):
                 peer_key = data[8:].decode()
                 console.print(f"[cyan]Clé reçue :[/cyan] {peer_key}")
+            elif data.startswith(b"**FILE**"):
+                # Le message est un fichier
+                file_name = data[7:].decode()
+                console.print(f"[cyan]Réception du fichier : {file_name}[/cyan]")
+
+                # Recevoir le contenu du fichier
+                file_data = sock.recv(65536)  # Assurez-vous d'avoir un large buffer pour le fichier
+                if file_data:
+                    # Enregistrer le fichier dans le dossier 'received_files'
+                    if not os.path.exists('received_files'):
+                        os.makedirs('received_files')
+                    with open(f'received_files/{file_name}', 'wb') as file:
+                        file.write(file_data)
+                    console.print(f"[green]Fichier {file_name} enregistré avec succès ![/green]")
             else:
                 # Décryptage et affichage du message reçu
                 msg = aes.decrypt(data).decode()
