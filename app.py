@@ -1,4 +1,5 @@
-# trcom.py - Communication sécurisée en AES entre deux appareils en réseau local (client + serveur)
+# app.py - Communication sécurisée en AES entre deux appareils en réseau local (client + serveur)
+# author - trhacknon
 
 import socket
 import threading
