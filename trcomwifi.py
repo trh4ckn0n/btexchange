@@ -1,193 +1,141 @@
-import socket
-import threading
-import argparse
 import os
-import sys
-import base64
+import socket
 import hashlib
-import ipaddress
-import concurrent.futures
 import questionary
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import threading
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
-import time
+from rich.console import Console
 
 console = Console()
 
-# Animation logo
-def show_logo():
-    logo = Text("""
- ████████╗██████╗ ██╗  ██╗ █████╗  ██████╗███╗   ██╗ ██████╗ ███╗   ██╗
- ╚══██╔══╝██╔══██╗██║  ██║██╔══██╗██╔════╝████╗  ██║██╔═══██╗████╗  ██║
-    ██║   ██████╔╝███████║███████║██║     ██╔██╗ ██║██║   ██║██╔██╗ ██║
-    ██║   ██╔═══╝ ██╔══██║██╔══██║██║     ██║╚██╗██║██║   ██║██║╚██╗██║
-    ██║   ██║     ██║  ██║██║  ██║╚██████╗██║ ╚████║╚██████╔╝██║ ╚████║
-    ╚═╝   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═══╝
-
-              [trhacknon] Secure Terminal Messenger - trcom
-    """, style="bold magenta")
-    console.print(Panel(logo, style="green"))
-    time.sleep(1)
-
-# AES
 class AESCipher:
     def __init__(self, key: str):
+        # Génération de la clé en utilisant SHA-256
         digest = hashlib.sha256(key.encode()).digest()
         self.key = digest
         self.backend = default_backend()
 
     def encrypt(self, data: bytes) -> bytes:
+        # Génération d'un IV aléatoire pour chaque chiffrement
         iv = os.urandom(16)
+        
+        # Padding des données avec PKCS7 pour que la taille soit un multiple de 16 octets
         padder = padding.PKCS7(128).padder()
         padded_data = padder.update(data) + padder.finalize()
+        
+        # Initialisation de l'algorithme AES en mode CBC
         cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=self.backend)
         encryptor = cipher.encryptor()
+        
+        # Retourne l'IV suivi des données chiffrées
         return iv + encryptor.update(padded_data) + encryptor.finalize()
 
     def decrypt(self, data: bytes) -> bytes:
+        # Extraction de l'IV des données chiffrées
         iv = data[:16]
+        
+        # Initialisation de l'algorithme AES en mode CBC
         cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=self.backend)
         decryptor = cipher.decryptor()
+        
+        # Déchiffrement des données
         decrypted = decryptor.update(data[16:]) + decryptor.finalize()
+
+        # Unpadding des données après déchiffrement
         unpadder = padding.PKCS7(128).unpadder()
         return unpadder.update(decrypted) + unpadder.finalize()
 
-# Scan réseau local
-def scan_network(port):
-    local_ip = socket.gethostbyname(socket.gethostname())
-    subnet = local_ip.rsplit('.', 1)[0] + '.0/24'
-    found = []
+def send_message(sock, aes):
+    while True:
+        message = questionary.text("Votre message :").ask()
+        if message.lower() == "exit":
+            console.print("[red]Déconnexion du serveur...[/red]")
+            sock.close()
+            break
+        encrypted_message = aes.encrypt(message.encode())
+        sock.sendall(encrypted_message)  # Envoi du message chiffré
 
-    def try_connect(ip):
-        try:
-            s = socket.socket()
-            s.settimeout(0.5)
-            s.connect((str(ip), port))
-            s.close()
-            return str(ip)
-        except:
-            return None
-
-    console.print("[yellow]Scan du réseau en cours...[/yellow]")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-        futures = [executor.submit(try_connect, ip) for ip in ipaddress.IPv4Network(subnet)]
-        for f in concurrent.futures.as_completed(futures):
-            if f.result():
-                found.append(f.result())
-
-    if found:
-        choices = [f"{i}: {ip}" for i, ip in enumerate(found)]
-        choice = questionary.select("Choisis un hôte à connecter :", choices=choices).ask()
-        return found[int(choice.split(":")[0])]
-    else:
-        console.print("[red]Aucun hôte détecté.")
-        sys.exit(1)
-
-# Envoi fichier
-def send_file(sock, aes):
-    filepath = questionary.path("Chemin du fichier à envoyer :").ask()
-    if not filepath or not os.path.exists(filepath):
-        console.print("[red]Fichier introuvable.")
-        return
-
-    with open(filepath, "rb") as f:
-        data = f.read()
-    filename = os.path.basename(filepath)
-    sock.sendall(b"**FILE**" + aes.encrypt(filename.encode()) + b"**SEP**" + aes.encrypt(data))
-    console.print(f"[green]Fichier '{filename}' envoyé.")
-
-# Réception
 def handle_recv(sock, aes):
     while True:
         try:
+            # Réception des données par morceaux (buffer plus petit pour éviter un blocage)
             data = sock.recv(65536)
+            if not data:
+                break  # Connexion fermée
+            
+            # Vérification du préfixe pour le type de données reçues
             if data.startswith(b"**KEY**"):
                 peer_key = data[8:].decode()
                 console.print(f"[cyan]Clé reçue :[/cyan] {peer_key}")
-            elif data.startswith(b"**FILE**"):
-                parts = data[9:].split(b"**SEP**")
-                filename = aes.decrypt(parts[0]).decode()
-                filedata = aes.decrypt(parts[1])
-                with open(f"received_{filename}", "wb") as f:
-                    f.write(filedata)
-                console.print(f"[cyan]Fichier reçu :[/cyan] received_{filename}")
             else:
+                # Décryptage et affichage du message reçu
                 msg = aes.decrypt(data).decode()
                 console.print(f"[bold blue]<< {msg}")
         except Exception as e:
-            console.print("[red]Erreur :", e)
+            console.print(f"[red]Erreur : {e}")
             break
 
-# Envoi
-def handle_send(sock, aes):
-    while True:
-        try:
-            msg = questionary.text(">>").ask()
-            if not msg:
-                continue
-            if msg.lower().startswith("/file"):
-                send_file(sock, aes)
-            elif msg.lower() == "/exit":
-                sock.close()
-                sys.exit()
-            else:
-                sock.sendall(aes.encrypt(msg.encode()))
-        except Exception as e:
-            console.print("[red]Erreur d'envoi :", e)
-            break
+def main():
+    console.print("[bold green]Sécurisé avec AES et clé partagée.[/bold green]")
 
-def start_server(port, key):
+    # Demander la clé de chiffrement partagée et l'adresse IP du serveur
+    key = questionary.text("Clé de chiffrement partagée :").ask()
+    mode = questionary.select("Mode ?", choices=["client", "serveur"]).ask()
+
+    # Création de l'objet AES pour le chiffrement
     aes = AESCipher(key)
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", port))
-    s.listen(1)
-    console.print(f"[green]En attente de connexion sur le port {port}...")
-    conn, addr = s.accept()
-    console.print(f"[bold green]Connecté avec {addr}")
-    conn.sendall(b"**KEY**" + key.encode())
-    threading.Thread(target=handle_recv, args=(conn, aes), daemon=True).start()
-    handle_send(conn, aes)
 
-def start_client(host, port, key):
-    aes = AESCipher(key)
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.connect((host, port))
-        console.print(f"[green]Connecté à {host}:{port}")
-        s.sendall(b"**KEY**" + key.encode())
-        threading.Thread(target=handle_recv, args=(s, aes), daemon=True).start()
-        handle_send(s, aes)
-    except Exception as e:
-        console.print("[red]Connexion impossible :", e)
+    if mode == "client":
+        ip = questionary.text("Adresse IP du serveur :").ask()
+        port = 9999  # Le port à utiliser
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((ip, port))
 
-# Entrée principale
-if __name__ == "__main__":
-    os.makedirs(".trcom_logs", exist_ok=True)
-    show_logo()
+        # Clé envoyée au serveur
+        sock.sendall(b"**KEY**" + key.encode())
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["server", "client"])
-    parser.add_argument("--host")
-    parser.add_argument("--port", type=int, default=9999)
-    parser.add_argument("--key")
-    parser.add_argument("--scan", action="store_true")
-    args = parser.parse_args()
+        # Démarrage des threads pour gérer la réception et l'envoi en parallèle
+        recv_thread = threading.Thread(target=handle_recv, args=(sock, aes))
+        send_thread = threading.Thread(target=send_message, args=(sock, aes))
 
-    if not args.mode:
-        args.mode = questionary.select("Mode ?", choices=["server", "client"]).ask()
+        recv_thread.start()
+        send_thread.start()
 
-    if not args.key:
-        args.key = questionary.text("Clé de chiffrement partagée :").ask()
+        # Attente de la fin des threads
+        recv_thread.join()
+        send_thread.join()
 
-    if args.mode == "server":
-        start_server(args.port, args.key)
     else:
-        if args.scan:
-            args.host = scan_network(args.port)
-        elif not args.host:
-            args.host = questionary.text("Adresse IP du serveur :").ask()
-        start_client(args.host, args.port, args.key)
+        # Serveur - écoute sur le port spécifié
+        port = 9999
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('0.0.0.0', port))
+        sock.listen(1)
+        console.print(f"[cyan]Serveur en écoute sur le port {port}...[/cyan]")
+        
+        conn, addr = sock.accept()
+        console.print(f"[cyan]Connexion de {addr} établie.[/cyan]")
+
+        # Réception de la clé du client
+        data = conn.recv(1024)
+        if data.startswith(b"**KEY**"):
+            peer_key = data[8:].decode()
+            console.print(f"[cyan]Clé reçue :[/cyan] {peer_key}")
+
+        # Démarrage des threads pour gérer la réception et l'envoi en parallèle
+        recv_thread = threading.Thread(target=handle_recv, args=(conn, aes))
+        send_thread = threading.Thread(target=send_message, args=(conn, aes))
+
+        recv_thread.start()
+        send_thread.start()
+
+        # Attente de la fin des threads
+        recv_thread.join()
+        send_thread.join()
+
+if __name__ == "__main__":
+    main()
