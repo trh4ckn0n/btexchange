@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 import time
+import bluetooth  # Importation pour Bluetooth
 
 console = Console()
 
@@ -87,6 +88,18 @@ def scan_network(port):
         console.print("[red]Aucun hôte détecté.")
         sys.exit(1)
 
+# Fonction Bluetooth pour scanner les appareils
+def scan_bluetooth():
+    console.print("[yellow]Scan Bluetooth en cours...[/yellow]")
+    nearby_devices = bluetooth.discover_devices(duration=8, lookup_names=True, lookup_oui=True)
+    if nearby_devices:
+        choices = [f"{i}: {name} ({addr})" for i, (addr, name) in enumerate(nearby_devices)]
+        choice = questionary.select("Choisis un appareil Bluetooth :", choices=choices).ask()
+        return nearby_devices[int(choice.split(":")[0])][0]
+    else:
+        console.print("[red]Aucun appareil Bluetooth trouvé.")
+        sys.exit(1)
+
 # Envoi fichier
 def send_file(sock, aes):
     filepath = questionary.path("Chemin du fichier à envoyer :").ask()
@@ -140,29 +153,45 @@ def handle_send(sock, aes):
             console.print("[red]Erreur d'envoi :", e)
             break
 
-def start_server(port, key):
+def start_server(port, key, is_bluetooth=False, bt_addr=None):
     aes = AESCipher(key)
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", port))
-    s.listen(1)
-    console.print(f"[green]En attente de connexion sur le port {port}...")
-    conn, addr = s.accept()
-    console.print(f"[bold green]Connecté avec {addr}")
-    conn.sendall(b"**KEY**" + key.encode())
-    threading.Thread(target=handle_recv, args=(conn, aes), daemon=True).start()
-    handle_send(conn, aes)
+    if is_bluetooth:
+        server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+        server_sock.bind(("", bluetooth.PORT_ANY))
+        server_sock.listen(1)
+        console.print(f"[green]En attente de connexion Bluetooth...")
+        client_sock, client_info = server_sock.accept()
+        console.print(f"[bold green]Connecté avec {client_info}")
+    else:
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.bind(("0.0.0.0", port))
+        server_sock.listen(1)
+        console.print(f"[green]En attente de connexion sur le port {port}...")
+        client_sock, addr = server_sock.accept()
+        console.print(f"[bold green]Connecté avec {addr}")
+    client_sock.sendall(b"**KEY**" + key.encode())
+    threading.Thread(target=handle_recv, args=(client_sock, aes), daemon=True).start()
+    handle_send(client_sock, aes)
 
-def start_client(host, port, key):
+def start_client(host, port, key, is_bluetooth=False):
     aes = AESCipher(key)
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.connect((host, port))
-        console.print(f"[green]Connecté à {host}:{port}")
-        s.sendall(b"**KEY**" + key.encode())
-        threading.Thread(target=handle_recv, args=(s, aes), daemon=True).start()
-        handle_send(s, aes)
-    except Exception as e:
-        console.print("[red]Connexion impossible :", e)
+    if is_bluetooth:
+        client_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+        client_sock.connect((host, 1))  # Port 1 est le port par défaut pour RFCOMM
+        console.print(f"[green]Connecté à Bluetooth {host}")
+        client_sock.sendall(b"**KEY**" + key.encode())
+        threading.Thread(target=handle_recv, args=(client_sock, aes), daemon=True).start()
+        handle_send(client_sock, aes)
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect((host, port))
+            console.print(f"[green]Connecté à {host}:{port}")
+            s.sendall(b"**KEY**" + key.encode())
+            threading.Thread(target=handle_recv, args=(s, aes), daemon=True).start()
+            handle_send(s, aes)
+        except Exception as e:
+            console.print("[red]Connexion impossible :", e)
 
 # Entrée principale
 if __name__ == "__main__":
@@ -175,6 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=9999)
     parser.add_argument("--key")
     parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--bluetooth", action="store_true", help="Utiliser Bluetooth pour la connexion")
     args = parser.parse_args()
 
     if not args.mode:
@@ -183,11 +213,21 @@ if __name__ == "__main__":
     if not args.key:
         args.key = questionary.text("Clé de chiffrement partagée :").ask()
 
-    if args.mode == "server":
-        start_server(args.port, args.key)
+    if args.bluetooth:
+        if args.mode == "server":
+            start_server(args.port, args.key, is_bluetooth=True)
+        else:
+            if args.scan:
+                bt_addr = scan_bluetooth()
+                start_client(bt_addr, args.port, args.key, is_bluetooth=True)
+            else:
+                start_client(args.host, args.port, args.key, is_bluetooth=True)
     else:
-        if args.scan:
-            args.host = scan_network(args.port)
-        elif not args.host:
-            args.host = questionary.text("Adresse IP du serveur :").ask()
-        start_client(args.host, args.port, args.key)
+        if args.mode == "server":
+            start_server(args.port, args.key)
+        else:
+            if args.scan:
+                args.host = scan_network(args.port)
+            elif not args.host:
+                args.host = questionary.text("Adresse IP du serveur :").ask()
+            start_client(args.host, args.port, args.key)
